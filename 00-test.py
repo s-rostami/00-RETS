@@ -6,6 +6,7 @@ from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 
 from login import OneXLogin
 from urllib.parse import urlparse, quote
+from metadata import CompactMetadata, StandardXMLetadata
 from exceptions import NotLoggedIn, MissingVersion, HTTPException, RETSException, MaxrowException
 
 logging.getLogger("urllib3").setLevel(logging.ERROR) #IH
@@ -15,7 +16,7 @@ class Session(object):
 
     allowed_auth = ['basic', 'digest']
 
-    def __init__(self, login_url, username, password=None, version='1.7.2', http_auth='basic',
+    def __init__(self, login_url, username, password=None, version='1.7.2', http_auth='digest',
                  user_agent='Python RETS', user_agent_password=None, cache_metadata=True,
                  follow_redirects=True, use_post_method=True, metadata_format='STANDARD-XML'):
         """
@@ -50,7 +51,7 @@ class Session(object):
         self.session_id = None
         if self.http_authentication == 'basic':
             self.client.auth = HTTPBasicAuth(self.username, self.password)
-            print(f'AAAAAAAAA the authentication methos is {self.http_authentication.title() }.')
+            print(f'the authentication methos is {self.http_authentication.title() }.')
         else:
             self.client.auth = HTTPDigestAuth(self.username, self.password)
 
@@ -60,7 +61,7 @@ class Session(object):
             'Accept-Encoding': 'gzip',
             'Accept': '*/*'
         }
-        print(f'CCCCCCCCC client header is ::::::: {self.client.headers}.')
+        print(f'client header is ::::::: {self.client.headers}.')
 
         self.follow_redirects = follow_redirects
         self.use_post_method = use_post_method
@@ -76,6 +77,7 @@ class Session(object):
         self.logout()
 
     def add_capability(self, name, uri):
+      print('add_capability function is called')
     
       """
       Add a capability of the RETS board
@@ -85,9 +87,9 @@ class Session(object):
       """
     
       parse_results = urlparse(uri)
-      print(f' PPPPPPPP: this is url parse:    {parse_results}.')
+      #print(f' PPPPPPPP: this is url parse:    {parse_results}.')
       if parse_results.hostname is None:
-          print('relative URL given, so build this into an absolute URL')
+          #print('relative URL given, so build this into an absolute URL')
           login_url = self.capabilities.get('Login')
           if not login_url:
               logger.error("There is no login URL stored, so additional capabilities cannot be added.")
@@ -98,38 +100,105 @@ class Session(object):
       print(f'capabilities: {self.capabilities}')
 
     def login(self):
-        """
-        Login to the RETS board and return an instance of Bulletin
-        :return: Bulletin instance
-        """
-        response = self._request('Login')
-        print(f'RRRRRRR: this is the response:     {response}.')
-        parser = OneXLogin()
-        parser.parse(response)
+      print('login function is called')
+      """
+      Login to the RETS board and return an instance of Bulletin
+      :return: Bulletin instance
+      """
+      response = self._request('Login')
+      print(f'this is the response of login function:     {response}.')
+      parser = OneXLogin()
+      parser.parse(response)
 
-        self.session_id = response.cookies.get('RETS-Session-ID', '')
-        print(f'LLLLLLLLLLL This is the self.session_id: {self.session_id}.')
+      self.session_id = response.cookies.get('RETS-Session-ID', '')
+      print(f'This is the self.session_id of login function: {self.session_id}.')
 
-        if parser.headers.get('RETS-Version') is not None:
-            self.version = str(parser.headers.get('RETS-Version'))
-            self.client.headers['RETS-Version'] = self.version
+      if parser.headers.get('RETS-Version') is not None:
+          self.version = str(parser.headers.get('RETS-Version'))
+          self.client.headers['RETS-Version'] = self.version
 
-        for k, v in parser.capabilities.items():
-            self.add_capability(k, v)
+      for k, v in parser.capabilities.items():
+          self.add_capability(k, v)
 
-        if self.capabilities.get('Action'):
-            self._request('Action')
-        return True
+      if self.capabilities.get('Action'):
+          self._request('Action')
+      return True
 
     def logout(self):
+        print('logout function is called')
         """
         Logs out of the RETS feed destroying the HTTP session.
         :return: True
         """
         self._request(capability='Logout')
         return True
-        
+
+    def get_system_metadata(self):
+        print('get_sytem_metadat is called')
+        """
+        Get the top level metadata
+        :return: list
+        """
+        result = self._make_metadata_request(meta_id='*', metadata_type='METADATA-SYSTEM')
+        print(f'result is : {result}')
+        # Get dict out of list
+        return result.pop()
+
+    def _make_metadata_request(self, meta_id, metadata_type=None):
+        print('_make_metadata_request is called')
+        """
+        Get the Metadata. The Session initializes with 'COMPACT-DECODED' as the format type. If that returns a DTD error
+        then we change to the 'STANDARD-XML' format and try again.
+        :param meta_id: The name of the resource, class, or lookup to get metadata for
+        :param metadata_type: The RETS metadata type
+        :return: list
+        """
+        # If this metadata _request has already happened, returned the saved result.
+        key = '{0!s}:{1!s}'.format(metadata_type, meta_id)
+        if key in self.metadata_responses and self.cache_metadata:
+            response = self.metadata_responses[key]
+        else:
+            response = self._request(
+                capability='GetMetadata',
+                options={
+                    'query': {
+                        'Type': metadata_type,
+                        'ID': meta_id,
+                        'Format': self.metadata_format
+                    }
+                }
+            )
+            self.metadata_responses[key] = response
+        print(f'response is :   {response}')
+
+        if self.metadata_format == 'SCOMPACT-DECODED':
+            parser = CompactMetadata()
+        else:
+            parser = StandardXMLetadata()
+
+        try:
+            return parser.parse(response=response, metadata_type=metadata_type)
+        except RETSException as e:
+            # If the server responds with an invalid parameter for COMPACT-DECODED, try STANDARD-XML
+            if self.metadata_format != 'STANDARD-XML' and e.reply_code in ['20513', '20514']:
+                self.metadata_responses.pop(key, None)
+                self.metadata_format = 'STANDARD-XML'
+                return self._make_metadata_request(meta_id=meta_id, metadata_type=metadata_type)
+            raise RETSException(e.reply_text, e.reply_code)
+
+    def get_resource_metadata(self, resource=None):
+        """
+        Get resource metadata
+        :param resource_id: The name of the resource to get metadata for
+        :return: list
+        """
+        result = self._make_metadata_request(meta_id=0, metadata_type='METADATA-RESOURCE')
+        if resource:
+            result = next((item for item in result if item['ResourceID'] == resource), None)
+        return result
+
     def _request(self, capability, options=None, stream=False):
+        print('_request function is called')
         """
         Make a _request to the RETS server
         :param capability: The name of the capability to use to get the URI
@@ -141,9 +210,9 @@ class Session(object):
         options.update({
             'headers': self.client.headers.copy()
         })
-        print(f'OOOOOPtion is _________________________________ {options}')
+       
         url = self.capabilities.get(capability)
-        print(f'*************           this is url :::: {url}')
+
         if not url:
             msg = "{0!s} tried but no valid endpoints was found. Did you forget to Login?".format(capability)
             raise NotLoggedIn(msg)
@@ -152,11 +221,11 @@ class Session(object):
             options['headers']['RETS-UA-Authorization'] = 'Digest {0!s}'.format(ua_digest)
         
         if self.use_post_method and capability != 'Action':  # Action Requests should always be GET
-            print(True)
+        
             query = options.get('query')
-            print(query)
+            print(f'query is:  {query}')
             response = self.client.post(url, data=query, headers=options['headers'], stream=stream)
-            print(response)
+            print(f'Response is: {response}')
         else:
             if 'query' in options:
                 url += '?' + '&'.join('{0!s}={1!s}'.format(k, quote(str(v))) for k, v in options['query'].items())
@@ -184,4 +253,8 @@ password = 'mFqMsCSPdnb5WO1gpEEtDCHH'
 
 s = Session(login_url, username, password)
 s.login()
+system_data = s.get_system_metadata()
+print(system_data)
+resources = s.get_resource_metadata(resource='Agent')
+print(resources)
 s.logout()
